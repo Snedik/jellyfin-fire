@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jellyfin Fire <cedric@grein.io>
+Date: Tue, 3 Nov 2026 21:28:03 +0100
+Subject: [PATCH 6/6] Fix integrated player crash on Android 9 / Fire TV (PR
+ #2224)
+
+---
+ .../interaction/PlayerNotificationHelper.kt   | 126 ++++++++++--------
+ 1 file changed, 74 insertions(+), 52 deletions(-)
+
+diff --git a/app/src/main/java/org/jellyfin/mobile/player/interaction/PlayerNotificationHelper.kt b/app/src/main/java/org/jellyfin/mobile/player/interaction/PlayerNotificationHelper.kt
+index 6f4a3106..31acbe9c 100644
+--- a/app/src/main/java/org/jellyfin/mobile/player/interaction/PlayerNotificationHelper.kt
++++ b/app/src/main/java/org/jellyfin/mobile/player/interaction/PlayerNotificationHelper.kt
+@@ -31,6 +31,7 @@ import org.jellyfin.mobile.utils.AndroidVersion
+ import org.jellyfin.mobile.utils.Constants
+ import org.jellyfin.mobile.utils.Constants.VIDEO_PLAYER_NOTIFICATION_ID
+ import org.jellyfin.mobile.utils.createMediaNotificationChannel
++import org.jellyfin.mobile.utils.isTvDevice
+ import org.jellyfin.sdk.api.client.ApiClient
+ import org.jellyfin.sdk.api.client.extensions.imageApi
+ import org.jellyfin.sdk.api.operations.ImageApi
+@@ -54,12 +55,12 @@ class PlayerNotificationHelper(private val viewModel: PlayerViewModel) : KoinCom
+     private val notificationActionReceiver: BroadcastReceiver = object : BroadcastReceiver() {
+         override fun onReceive(context: Context, intent: Intent) {
+             when (intent.action) {
+-                Constants.ACTION_PLAY -> viewModel.play()
+-                Constants.ACTION_PAUSE -> viewModel.pause()
+-                Constants.ACTION_REWIND -> viewModel.rewind()
+-                Constants.ACTION_FAST_FORWARD -> viewModel.fastForward()
+-                Constants.ACTION_PREVIOUS -> viewModel.skipToPrevious()
+-                Constants.ACTION_NEXT -> viewModel.skipToNext()
++                Constants.ACTION_PLAY -> viewModel.userPlay()
++                Constants.ACTION_PAUSE -> viewModel.userPause()
++                Constants.ACTION_REWIND -> viewModel.userRewind()
++                Constants.ACTION_FAST_FORWARD -> viewModel.userFastForward()
++                Constants.ACTION_PREVIOUS -> viewModel.userSkipToPrevious()
++                Constants.ACTION_NEXT -> viewModel.userSkipToNext()
+                 Constants.ACTION_STOP -> viewModel.stop()
+             }
+         }
+@@ -67,6 +68,10 @@ class PlayerNotificationHelper(private val viewModel: PlayerViewModel) : KoinCom
+ 
+     @Suppress("DEPRECATION", "CyclomaticComplexMethod", "LongMethod")
+     fun postNotification() {
++        // TVs have no notification shade, and the foreground service could crash the app on Android 9
++        // when playback is replaced quickly (e.g. by SyncPlay), as it would be stopped before starting
++        if (context.isTvDevice) return
++
+         val nm = notificationManager ?: return
+         val player = viewModel.playerOrNull ?: return
+         val currentMediaSource = viewModel.queueManager.getCurrentMediaSourceOrNull() ?: return
+@@ -78,57 +83,33 @@ class PlayerNotificationHelper(private val viewModel: PlayerViewModel) : KoinCom
+         // Create notification channel
+         context.createMediaNotificationChannel(nm)
+ 
+-        viewModel.viewModelScope.launch {
+-            val style = Notification.MediaStyle().apply {
+-                setMediaSession(viewModel.mediaSession.sessionToken)
+-                setShowActionsInCompactView(0, 1, 2)
+-            }
++        val style = Notification.MediaStyle().apply {
++            setMediaSession(viewModel.mediaSession.sessionToken)
++            setShowActionsInCompactView(0, 1, 2)
++        }
++
++        // Build a minimal notification synchronously to start the foreground service immediately.
++        // Android requires startForeground() to be called within 5 seconds of startForegroundService(),
++        // so we must not delay the service start behind any async work (e.g. image loading).
++        val baseNotification = buildBaseNotification(style, player, currentMediaSource, hasPrevious, hasNext)
++        nm.notify(VIDEO_PLAYER_NOTIFICATION_ID, baseNotification)
++        PlayerService.start(context, baseNotification)
+ 
+-            val notification = Notification.Builder(context).apply {
+-                if (AndroidVersion.isAtLeastO) {
+-                    // Set notification channel on Android O and above
+-                    setChannelId(Constants.MEDIA_NOTIFICATION_CHANNEL_ID)
+-                    setColorized(true)
+-                } else {
+-                    setPriority(Notification.PRIORITY_LOW)
++        viewModel.viewModelScope.launch {
++            // On Android < Q, load the album art and post an updated notification with the image.
++            // The foreground service is already running at this point, so this is safe to do async.
++            if (!AndroidVersion.isAtLeastQ) {
++                val mediaIcon: Bitmap? = withContext(Dispatchers.IO) {
++                    loadImage(currentMediaSource)
+                 }
+-                setStyle(style)
+-                setSmallIcon(R.drawable.ic_notification)
+-                if (!AndroidVersion.isAtLeastQ) {
+-                    val mediaIcon: Bitmap? = withContext(Dispatchers.IO) {
+-                        loadImage(currentMediaSource)
+-                    }
+-                    if (mediaIcon != null) {
++                if (mediaIcon != null) {
++                    val updatedNotification = buildBaseNotification(style, player, currentMediaSource, hasPrevious, hasNext) {
+                         setLargeIcon(mediaIcon)
+                     }
++                    nm.notify(VIDEO_PLAYER_NOTIFICATION_ID, updatedNotification)
++                    PlayerService.start(context, updatedNotification)
+                 }
+-                setContentTitle(currentMediaSource.getName(context))
+-                currentMediaSource.item?.artists?.joinToString()?.let { artists ->
+-                    setContentText(artists)
+-                }
+-                setVisibility(Notification.VISIBILITY_PUBLIC)
+-                when {
+-                    hasPrevious -> addAction(generateAction(PlayerNotificationAction.PREVIOUS))
+-                    else -> addAction(generateAction(PlayerNotificationAction.REWIND))
+-                }
+-                val playbackAction = when {
+-                    !player.playWhenReady -> PlayerNotificationAction.PLAY
+-                    else -> PlayerNotificationAction.PAUSE
+-                }
+-                addAction(generateAction(playbackAction))
+-                when {
+-                    hasNext -> addAction(generateAction(PlayerNotificationAction.NEXT))
+-                    else -> addAction(generateAction(PlayerNotificationAction.FAST_FORWARD))
+-                }
+-                setContentIntent(buildContentIntent())
+-                setDeleteIntent(buildDeleteIntent())
+-
+-                // prevents the notification from being dismissed while playback is ongoing
+-                setOngoing(player.isPlaying)
+-            }.build()
+-
+-            nm.notify(VIDEO_PLAYER_NOTIFICATION_ID, notification)
+-            PlayerService.start(context, notification)
++            }
+         }
+ 
+         if (receiverRegistered.compareAndSet(false, true)) {
+@@ -153,6 +134,47 @@ class PlayerNotificationHelper(private val viewModel: PlayerViewModel) : KoinCom
+         }
+     }
+ 
++    @Suppress("DEPRECATION")
++    private fun buildBaseNotification(
++        style: Notification.MediaStyle,
++        player: Player,
++        currentMediaSource: JellyfinMediaSource,
++        hasPrevious: Boolean,
++        hasNext: Boolean,
++        extra: (Notification.Builder.() -> Unit)? = null,
++    ): Notification = Notification.Builder(context).apply {
++        if (AndroidVersion.isAtLeastO) {
++            setChannelId(Constants.MEDIA_NOTIFICATION_CHANNEL_ID)
++            setColorized(true)
++        } else {
++            setPriority(Notification.PRIORITY_LOW)
++        }
++        setStyle(style)
++        setSmallIcon(R.drawable.ic_notification)
++        setContentTitle(currentMediaSource.getName(context))
++        currentMediaSource.item?.artists?.joinToString()?.let { artists ->
++            setContentText(artists)
++        }
++        setVisibility(Notification.VISIBILITY_PUBLIC)
++        when {
++            hasPrevious -> addAction(generateAction(PlayerNotificationAction.PREVIOUS))
++            else -> addAction(generateAction(PlayerNotificationAction.REWIND))
++        }
++        val playbackAction = when {
++            !player.playWhenReady -> PlayerNotificationAction.PLAY
++            else -> PlayerNotificationAction.PAUSE
++        }
++        addAction(generateAction(playbackAction))
++        when {
++            hasNext -> addAction(generateAction(PlayerNotificationAction.NEXT))
++            else -> addAction(generateAction(PlayerNotificationAction.FAST_FORWARD))
++        }
++        setContentIntent(buildContentIntent())
++        setDeleteIntent(buildDeleteIntent())
++        setOngoing(player.isPlaying)
++        extra?.invoke(this)
++    }.build()
++
+     private suspend fun loadImage(mediaSource: JellyfinMediaSource) = when (mediaSource) {
+         is LocalJellyfinMediaSource -> null
+         is RemoteJellyfinMediaSource -> {

@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jellyfin Fire <cedric@grein.io>
+Date: Tue, 3 Nov 2026 21:28:03 +0100
+Subject: [PATCH 5/6] Setting to enable WebView debugging
+
+---
+ .../org/jellyfin/mobile/JellyfinApplication.kt   | 16 +++++++++-------
+ .../org/jellyfin/mobile/app/AppPreferences.kt    |  3 +++
+ .../jellyfin/mobile/settings/SettingsFragment.kt | 13 +++++++++++++
+ 3 files changed, 25 insertions(+), 7 deletions(-)
+
+diff --git a/app/src/main/java/org/jellyfin/mobile/JellyfinApplication.kt b/app/src/main/java/org/jellyfin/mobile/JellyfinApplication.kt
+index 5acc9f17..99b6e8c2 100644
+--- a/app/src/main/java/org/jellyfin/mobile/JellyfinApplication.kt
++++ b/app/src/main/java/org/jellyfin/mobile/JellyfinApplication.kt
+@@ -2,11 +2,13 @@ package org.jellyfin.mobile
+ 
+ import android.app.Application
+ import android.webkit.WebView
++import org.jellyfin.mobile.app.AppPreferences
+ import org.jellyfin.mobile.app.apiModule
+ import org.jellyfin.mobile.app.applicationModule
+ import org.jellyfin.mobile.data.databaseModule
+ import org.jellyfin.mobile.utils.JellyTree
+ import org.jellyfin.mobile.utils.isWebViewSupported
++import org.koin.android.ext.android.get
+ import org.koin.android.ext.koin.androidContext
+ import org.koin.androidx.fragment.koin.fragmentFactory
+ import org.koin.core.context.startKoin
+@@ -20,13 +22,6 @@ class JellyfinApplication : Application() {
+         // Setup logging
+         Timber.plant(JellyTree())
+ 
+-        if (BuildConfig.DEBUG) {
+-            // Enable WebView debugging
+-            if (isWebViewSupported()) {
+-                WebView.setWebContentsDebuggingEnabled(true)
+-            }
+-        }
+-
+         startKoin {
+             androidContext(this@JellyfinApplication)
+             fragmentFactory()
+@@ -37,5 +32,12 @@ class JellyfinApplication : Application() {
+                 databaseModule,
+             )
+         }
++
++        // Enable WebView debugging for debug builds or if enabled in the settings
++        if (BuildConfig.DEBUG || get<AppPreferences>().webViewDebugging) {
++            if (isWebViewSupported()) {
++                WebView.setWebContentsDebuggingEnabled(true)
++            }
++        }
+     }
+ }
+diff --git a/app/src/main/java/org/jellyfin/mobile/app/AppPreferences.kt b/app/src/main/java/org/jellyfin/mobile/app/AppPreferences.kt
+index 0f33bc11..2d669260 100644
+--- a/app/src/main/java/org/jellyfin/mobile/app/AppPreferences.kt
++++ b/app/src/main/java/org/jellyfin/mobile/app/AppPreferences.kt
+@@ -40,6 +40,9 @@ class AppPreferences(context: Context) {
+             }
+         }
+ 
++    val webViewDebugging: Boolean
++        get() = sharedPreferences.getBoolean(Constants.PREF_WEBVIEW_DEBUGGING, false)
++
+     var ignoreWebViewChecks: Boolean
+         get() = sharedPreferences.getBoolean(Constants.PREF_IGNORE_WEBVIEW_CHECKS, false)
+         set(value) {
+diff --git a/app/src/main/java/org/jellyfin/mobile/settings/SettingsFragment.kt b/app/src/main/java/org/jellyfin/mobile/settings/SettingsFragment.kt
+index 12753cc4..089d2064 100644
+--- a/app/src/main/java/org/jellyfin/mobile/settings/SettingsFragment.kt
++++ b/app/src/main/java/org/jellyfin/mobile/settings/SettingsFragment.kt
+@@ -7,6 +7,7 @@ import android.view.LayoutInflater
+ import android.view.View
+ import android.view.ViewGroup
+ import android.view.WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
++import android.webkit.WebView
+ import androidx.activity.result.contract.ActivityResultContracts
+ import androidx.fragment.app.Fragment
+ import de.Maxr1998.modernpreferences.Preference
+@@ -289,11 +290,23 @@ class SettingsFragment : Fragment(), BackPressInterceptor {
+                 false
+             }
+         }
++
++        categoryHeader(PREF_CATEGORY_DEVELOPER) {
++            titleRes = R.string.pref_category_developer
++        }
++        checkBox(Constants.PREF_WEBVIEW_DEBUGGING) {
++            titleRes = R.string.pref_webview_debugging_title
++            summaryRes = R.string.pref_webview_debugging_summary
++            defaultOnCheckedChange { checked ->
++                WebView.setWebContentsDebuggingEnabled(checked)
++            }
++        }
+     }
+ 
+     companion object {
+         const val PREF_CATEGORY_MUSIC_PLAYER = "pref_category_music"
+         const val PREF_CATEGORY_VIDEO_PLAYER = "pref_category_video"
+         const val PREF_CATEGORY_DOWNLOADS = "pref_category_downloads"
++        const val PREF_CATEGORY_DEVELOPER = "pref_category_developer"
+     }
+ }

@@ -1,0 +1,43 @@
+/* Compact single-row header for the TV layout: left buttons, tabs, right buttons */
+.layout-tv .skinHeader {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+}
+
+.layout-tv .headerTop {
+    display: contents;
+}
+
+/* Equal width sides keep the tabs centered on screen */
+.layout-tv .headerLeft {
+    order: 0;
+    flex: 1 1 0;
+    padding-top: 0.3em;
+    padding-bottom: 0.3em;
+}
+
+.layout-tv .headerTabs {
+    order: 1;
+    flex: 0 1 auto;
+    min-width: 0;
+    width: auto;
+    display: flex;
+    justify-content: center;
+}
+
+.layout-tv .headerRight {
+    order: 2;
+    flex: 1 1 0;
+    justify-content: flex-end;
+}
+
+/* The active tab already names the page */
+.layout-tv .skinHeader:has(.headerTabs:not(.hide) .emby-tab-button) .pageTitle:not(.pageTitleWithDefaultLogo) {
+    display: none;
+}
+
+.layout-tv .pageWithAbsoluteTabs,
+.layout-tv .withTabs {
+    padding-top: 4em !important;
+}

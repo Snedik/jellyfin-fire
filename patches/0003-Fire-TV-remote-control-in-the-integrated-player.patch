@@ -1,0 +1,228 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jellyfin Fire <cedric@grein.io>
+Date: Tue, 3 Nov 2026 21:28:03 +0100
+Subject: [PATCH 3/6] Fire TV: remote control in the integrated player
+
+---
+ .../java/org/jellyfin/mobile/MainActivity.kt  |  9 ++
+ .../mobile/events/ActivityEventHandler.kt     |  5 ++
+ .../mobile/player/ui/PlayerFragment.kt        | 85 ++++++++++++++++++-
+ app/src/main/res/layout/fragment_player.xml   | 14 +++
+ 4 files changed, 110 insertions(+), 3 deletions(-)
+
+diff --git a/app/src/main/java/org/jellyfin/mobile/MainActivity.kt b/app/src/main/java/org/jellyfin/mobile/MainActivity.kt
+index e655ecb4..b0eb5e21 100644
+--- a/app/src/main/java/org/jellyfin/mobile/MainActivity.kt
++++ b/app/src/main/java/org/jellyfin/mobile/MainActivity.kt
+@@ -8,6 +8,7 @@ import android.graphics.Color
+ import android.os.Bundle
+ import android.os.IBinder
+ import android.provider.Settings
++import android.view.KeyEvent
+ import android.view.OrientationEventListener
+ import android.widget.Toast
+ import androidx.activity.OnBackPressedCallback
+@@ -191,6 +192,14 @@ class MainActivity : AppCompatActivity() {
+         return true
+     }
+ 
++    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
++        val playerFragment = supportFragmentManager.findFragmentById(R.id.fragment_container) as? PlayerFragment
++        if (playerFragment != null && playerFragment.isVisible && playerFragment.handleKeyEvent(event)) {
++            return true
++        }
++        return super.dispatchKeyEvent(event)
++    }
++
+     override fun onUserLeaveHint() {
+         super.onUserLeaveHint()
+         for (fragment in supportFragmentManager.fragments) {
+diff --git a/app/src/main/java/org/jellyfin/mobile/events/ActivityEventHandler.kt b/app/src/main/java/org/jellyfin/mobile/events/ActivityEventHandler.kt
+index 69c090a8..3144fe5b 100644
+--- a/app/src/main/java/org/jellyfin/mobile/events/ActivityEventHandler.kt
++++ b/app/src/main/java/org/jellyfin/mobile/events/ActivityEventHandler.kt
+@@ -64,6 +64,11 @@ class ActivityEventHandler(
+                     putParcelable(Constants.EXTRA_MEDIA_PLAY_OPTIONS, event.playOptions)
+                     putParcelable(Constants.EXTRA_WEB_PREFERENCES, event.preferences)
+                 }
++                // Close a player that is still open, otherwise both would keep playing
++                // with the new player stacked on top of the old one
++                while (supportFragmentManager.findFragmentById(R.id.fragment_container) is PlayerFragment) {
++                    supportFragmentManager.popBackStackImmediate()
++                }
+                 supportFragmentManager.addFragment<PlayerFragment>(args)
+             }
+             is ActivityEvent.OpenUrl -> {
+diff --git a/app/src/main/java/org/jellyfin/mobile/player/ui/PlayerFragment.kt b/app/src/main/java/org/jellyfin/mobile/player/ui/PlayerFragment.kt
+index c307fd62..f8c21790 100644
+--- a/app/src/main/java/org/jellyfin/mobile/player/ui/PlayerFragment.kt
++++ b/app/src/main/java/org/jellyfin/mobile/player/ui/PlayerFragment.kt
+@@ -9,6 +9,7 @@ import android.os.Build
+ import android.os.Bundle
+ import android.os.Handler
+ import android.os.Looper
++import android.view.KeyEvent
+ import android.view.LayoutInflater
+ import android.view.OrientationEventListener
+ import android.view.View
+@@ -26,6 +27,7 @@ import androidx.fragment.app.Fragment
+ import androidx.fragment.app.viewModels
+ import androidx.lifecycle.lifecycleScope
+ import androidx.media3.common.Player
++import androidx.media3.common.util.Util
+ import androidx.media3.ui.PlayerView
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.launch
+@@ -98,7 +100,7 @@ class PlayerFragment : Fragment(), BackPressInterceptor {
+ 
+         // Observe ViewModel
+         viewModel.player.observe(this) { player ->
+-            playerView.player = player
++            playerView.player = player?.let { UserActionPlayer(it, viewModel) }
+             // Automatically close fragment, unless we're in PiP mode
+             if (player == null && !(AndroidVersion.isAtLeastN && requireActivity().isInPictureInPictureMode)) {
+                 parentFragmentManager.popBackStack()
+@@ -116,6 +118,12 @@ class PlayerFragment : Fragment(), BackPressInterceptor {
+             val safeMessage = message.ifEmpty { requireContext().getString(R.string.player_error_unspecific_exception) }
+             requireContext().toast(safeMessage)
+         }
++        viewModel.syncPlayMessage.observe(this) { message ->
++            requireContext().toast(message)
++        }
++        viewModel.syncPlayWaiting.observe(this) { waiting ->
++            playerBinding.syncplayStatus.isVisible = waiting
++        }
+         viewModel.queueManager.currentMediaSource.observe(this) { mediaSource ->
+             if (mediaSource.selectedVideoStream?.isLandscape == false) {
+                 // For portrait videos, immediately enable fullscreen
+@@ -139,6 +147,8 @@ class PlayerFragment : Fragment(), BackPressInterceptor {
+                 context.toast(R.string.player_error_invalid_play_options)
+                 return@launch
+             }
++            viewModel.isSyncPlayActive = preferences?.syncPlay == true
++            viewModel.syncPlayToken = preferences?.syncPlayToken ?: 0
+             when (viewModel.queueManager.initializePlaybackQueue(playOptions, preferences)) {
+                 is PlayerException.InvalidPlayOptions -> context.toast(R.string.player_error_invalid_play_options)
+                 is PlayerException.NetworkFailure -> context.toast(R.string.player_error_network_failure)
+@@ -228,6 +238,9 @@ class PlayerFragment : Fragment(), BackPressInterceptor {
+     override fun onResume() {
+         super.onResume()
+ 
++        // Take the focus, so that remote control keys reach the player
++        playerView.requestFocus()
++
+         // When returning from another app, fullscreen mode for landscape orientation has to be set again
+         if (isLandscape()) {
+             playerFullscreenHelper.enableFullscreen()
+@@ -239,6 +252,72 @@ class PlayerFragment : Fragment(), BackPressInterceptor {
+         }
+     }
+ 
++    /**
++     * Key code of the last key press handled by [handleKeyEvent], its release has to be consumed as well.
++     */
++    private var handledKeyCode: Int? = null
++
++    private val hideSeekOverlayAction = Runnable {
++        _playerBinding?.seekOverlayLayout?.isVisible = false
++    }
++
++    /**
++     * Handles remote control keys while the player controls are hidden, as known from TV apps:
++     * OK toggles playback, left/right seek and up/down reveal the controls.
++     * Any other key event is left to the [PlayerView].
++     *
++     * @return true if the event was consumed
++     */
++    fun handleKeyEvent(event: KeyEvent): Boolean {
++        if (event.action == KeyEvent.ACTION_UP && event.keyCode == handledKeyCode) {
++            handledKeyCode = null
++            return true
++        }
++        if (event.action != KeyEvent.ACTION_DOWN || _playerBinding == null || playerView.isControllerFullyVisible) {
++            return false
++        }
++
++        when (event.keyCode) {
++            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
++                if (viewModel.playerOrNull == null) return false
++                viewModel.userPlayPause()
++                playerView.showController()
++            }
++            KeyEvent.KEYCODE_DPAD_LEFT -> {
++                viewModel.userRewind()
++                showSeekOverlay(forward = false)
++            }
++            KeyEvent.KEYCODE_DPAD_RIGHT -> {
++                viewModel.userFastForward()
++                showSeekOverlay(forward = true)
++            }
++            KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> playerView.showController()
++            else -> return false
++        }
++        handledKeyCode = event.keyCode
++        return true
++    }
++
++    private fun showSeekOverlay(forward: Boolean) {
++        val player = viewModel.playerOrNull ?: return
++        val position = player.currentPosition
++        val duration = player.duration.coerceAtLeast(0)
++        with(playerBinding) {
++            seekOverlayImage.setImageResource(
++                if (forward) R.drawable.ic_fast_forward_black_32dp else R.drawable.ic_rewind_black_32dp,
++            )
++            seekOverlayText.text = Util.getStringForTime(StringBuilder(), java.util.Formatter(), position)
++            seekPositionText.text = Util.getStringForTime(StringBuilder(), java.util.Formatter(), duration)
++            if (duration > 0) {
++                seekOverlayProgress.max = 1000
++                seekOverlayProgress.progress = (position * 1000 / duration).toInt()
++            }
++            seekOverlayLayout.isVisible = true
++            seekOverlayLayout.removeCallbacks(hideSeekOverlayAction)
++            seekOverlayLayout.postDelayed(hideSeekOverlayAction, Constants.DEFAULT_SEEK_OVERLAY_TIMEOUT_MS)
++        }
++    }
++
+     /**
+      * Handle current orientation and update fullscreen state and switcher icon
+      */
+@@ -349,11 +428,11 @@ class PlayerFragment : Fragment(), BackPressInterceptor {
+     }
+ 
+     fun onSkipToPrevious() {
+-        viewModel.skipToPrevious()
++        viewModel.userSkipToPrevious()
+     }
+ 
+     fun onSkipToNext() {
+-        viewModel.skipToNext()
++        viewModel.userSkipToNext()
+     }
+ 
+     fun onSkipMediaSegment(mediaSegmentDto: MediaSegmentDto?) {
+diff --git a/app/src/main/res/layout/fragment_player.xml b/app/src/main/res/layout/fragment_player.xml
+index 6118761a..84112770 100644
+--- a/app/src/main/res/layout/fragment_player.xml
++++ b/app/src/main/res/layout/fragment_player.xml
+@@ -113,6 +113,20 @@
+             android:layout_gravity="center"
+             android:visibility="gone" />
+ 
++        <androidx.appcompat.widget.AppCompatTextView
++            android:id="@+id/syncplay_status"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_gravity="center_horizontal|top"
++            android:layout_marginTop="48dp"
++            android:background="@drawable/playback_info_background"
++            android:padding="16dp"
++            android:text="@string/syncplay_waiting_for_group"
++            android:textColor="@android:color/white"
++            android:textSize="18sp"
++            android:visibility="gone"
++            tools:visibility="visible" />
++
+         <androidx.appcompat.widget.AppCompatTextView
+             android:id="@+id/playback_info"
+             android:layout_width="wrap_content"

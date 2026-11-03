@@ -1,0 +1,874 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jellyfin Fire <cedric@grein.io>
+Date: Tue, 3 Nov 2026 21:28:03 +0100
+Subject: [PATCH 4/6] SyncPlay for the integrated player
+
+---
+ app/src/main/assets/native/ExoPlayerPlugin.js | 331 +++++++++++++++++-
+ .../java/org/jellyfin/mobile/app/AppModule.kt |   3 +-
+ .../jellyfin/mobile/bridge/NativePlayer.kt    |  15 +
+ .../jellyfin/mobile/player/PlayerViewModel.kt | 158 ++++++++-
+ .../mobile/player/interaction/PlayerEvent.kt  |   3 +
+ .../interaction/PlayerMediaSessionCallback.kt |  14 +-
+ .../interaction/PlayerWebPreferences.kt       |   2 +
+ .../org/jellyfin/mobile/utils/Constants.kt    |  13 +
+ .../mobile/webapp/WebappFunctionChannel.kt    |   5 +-
+ app/src/main/res/values-de/strings.xml        |   6 +
+ app/src/main/res/values/strings.xml           |   6 +
+ 11 files changed, 534 insertions(+), 22 deletions(-)
+
+diff --git a/app/src/main/assets/native/ExoPlayerPlugin.js b/app/src/main/assets/native/ExoPlayerPlugin.js
+index 133d0ebf..fe3a062a 100644
+--- a/app/src/main/assets/native/ExoPlayerPlugin.js
++++ b/app/src/main/assets/native/ExoPlayerPlugin.js
+@@ -20,21 +20,254 @@ export class ExoPlayerPlugin {
+         this._paused = true;
+ 
+         this._nativePlayer = window['NativePlayer'];
++
++        // SyncPlay controls this player like the HTML video player, based on the events reported by notifyEvent()
++        this.syncPlayWrapAs = 'htmlvideoplayer';
++        this._syncPlay = false;
++        this._seeking = false;
++        this._playbackRate = 1;
++        this._positionUpdatedAt = 0;
++        this._onLoaded = null;
++        this._playToken = 0;
++        this._currentItem = null;
++        this._buffering = false;
++        this._groupWaiting = false;
++        this._groupUpdatesBound = false;
++
++        this._patchSetCurrentPlaylistItem();
++        this._patchCreateSyncPlayGroup();
++    }
++
++    /**
++     * The server takes the queue of a new group from the queue the creating session reported last, which it
++     * only updates when playback stops. After the native player moved on to another item, that queue doesn't
++     * contain the playing item anymore and the group ends up without one. Hand the playlist over instead.
++     * It has to include the following items: for a queue of a single episode, the web client adds the
++     * remaining episodes of the series locally and then fails to match its playlist with the group's.
++     */
++    _patchCreateSyncPlayGroup() {
++        const apiClient = window.ApiClient;
++        if (!apiClient) {
++            setTimeout(() => this._patchCreateSyncPlayGroup(), 1000);
++            return;
++        }
++        const proto = Object.getPrototypeOf(apiClient);
++        const originalCreateGroup = proto.createSyncPlayGroup;
++        if (!originalCreateGroup || originalCreateGroup._nativePatched) return;
++
++        const plugin = this;
++        proto.createSyncPlayGroup = function (options) {
++            if (!plugin._currentItem) {
++                return originalCreateGroup.call(this, options);
++            }
++            // Outside of SyncPlay, only the native player knows the playing item and position, which it reports
++            const nowPlaying = plugin._getReportedPlayback(this);
++            return originalCreateGroup.call(this, options).then(async (result) => {
++                const playback = await nowPlaying;
++                if (playback) {
++                    let queue = plugin._playlistItemIds || [];
++                    let index = queue.indexOf(playback.itemId);
++                    if (index < 0) {
++                        queue = [playback.itemId];
++                        index = 0;
++                    }
++                    this.requestSyncPlaySetNewQueue({
++                        PlayingQueue: queue,
++                        PlayingItemPosition: index,
++                        StartPositionTicks: playback.positionTicks,
++                    });
++                }
++                return result;
++            });
++        };
++        proto.createSyncPlayGroup._nativePatched = true;
++    }
++
++    /**
++     * Gets the playing item and position the native player reported to the server for this device.
++     * The native player reports with its own session, whose device id starts with the one of the web client.
++     */
++    async _getReportedPlayback(apiClient) {
++        try {
++            const deviceId = apiClient.deviceId();
++            const sessions = await apiClient.getSessions();
++            const session = sessions.find((s) => s.DeviceId?.startsWith(deviceId) && s.NowPlayingItem?.Id);
++            if (!session) return null;
++            let positionTicks = session.PlayState?.PositionTicks || 0;
++            // Account for the time since the last report
++            if (!session.PlayState?.IsPaused && session.LastPlaybackCheckIn) {
++                const elapsedMs = Date.now() - new Date(session.LastPlaybackCheckIn).getTime();
++                if (elapsedMs > 0 && elapsedMs < 60000) positionTicks += elapsedMs * 10000;
++            }
++            return { itemId: session.NowPlayingItem.Id, positionTicks: Math.round(positionTicks) };
++        } catch (e) {
++            console.warn('ExoPlayer: failed to get the reported playback', e);
++            return null;
++        }
++    }
++
++    /**
++     * Without an active player (e.g. after the previous item ended), the playback manager can't hand the
++     * playlist over to this player when changing the item, which SyncPlay does when the group moves on.
++     * Start the item with the whole playlist instead. SyncPlay saves this method when it becomes active.
++     */
++    _patchSetCurrentPlaylistItem() {
++        const playbackManager = this.playbackManager;
++        const originalSetCurrentPlaylistItem = playbackManager.setCurrentPlaylistItem;
++        playbackManager.setCurrentPlaylistItem = (playlistItemId, player) => {
++            if (!player && !playbackManager.getCurrentPlayer() && this._nativePlayer.isEnabled()) {
++                const items = playbackManager._playQueueManager?.getPlaylist?.() || [];
++                const startIndex = items.findIndex((item) => item.PlaylistItemId === playlistItemId);
++                const play = playbackManager._localPlay || playbackManager.play;
++                if (startIndex >= 0) {
++                    return play.call(playbackManager, { items, startIndex, startPositionTicks: 0, fullscreen: true });
++                }
++            }
++            return originalSetCurrentPlaylistItem.call(playbackManager, playlistItemId, player);
++        };
+     }
+ 
+     async play(options) {
++        // Remember the started item and its playlist, as this player manages its own playlist
++        this._currentItem = options.items[options.startIndex || 0];
++        this._playlistItemIds = options.items.map(item => item.Id);
++
+         // Sanitize input
+         options.ids = options.items.map(item => item.Id);
+         delete options.items;
+ 
++        this._syncPlay = this.playbackManager.syncPlayEnabled === true;
++        this._playToken++;
++        this._bindGroupUpdates();
+         const preferences = {
+             maxStreamingBitrateLocal: this.appSettings.maxStreamingBitrate(true, 'Video'),
+             maxStreamingBitrateRemote: this.appSettings.maxStreamingBitrate(false, 'Video'),
++            syncPlay: this._syncPlay,
++            syncPlayToken: this._playToken,
+         };
+ 
+         this._paused = false;
++        this._seeking = false;
++        this._playbackRate = 1;
++        this._setPosition((options.startPositionTicks || 0) / 10000);
++
++        // SyncPlay starts to control the player once play() returns, so wait until it's actually loaded
++        const loaded = this._syncPlay ? new Promise((resolve) => {
++            this._onLoaded = resolve;
++            setTimeout(resolve, 30000);
++        }) : Promise.resolve();
++
+         this._nativePlayer.loadPlayer(JSON.stringify(options), JSON.stringify(preferences));
+         this.loading.hide();
++        await loaded;
++        this._onLoaded = null;
++    }
++
++    /**
++     * Called by the native player to report playback events while SyncPlay is active.
++     * Translates them to the events of the HTML video player, which SyncPlay listens to.
++     * @param {string} event The event name.
++     * @param {number} positionMs The current playback position in milliseconds.
++     * @param {number} token The token of the playback, events of replaced players are ignored.
++     * @param {number} sampledAt The time of the position measurement, in milliseconds since the epoch.
++     */
++    notifyEvent(event, positionMs, token, sampledAt) {
++        if (!this._syncPlay || token !== this._playToken) return;
++        this._setPosition(positionMs, sampledAt);
++
++        switch (event) {
++            case 'loaded':
++                if (this._onLoaded) this._onLoaded();
++                // The playback manager only considers this player active once it reports the started item
++                setTimeout(() => this.events.trigger(this, 'itemstarted', [this._currentItem, this._getMediaSource()]));
++                break;
++            case 'playing':
++                // Playback before a pending seek is completed doesn't count
++                if (this._seeking) break;
++                this._setBuffering(false);
++                if (this._paused) {
++                    this._paused = false;
++                    this.events.trigger(this, 'unpause');
++                }
++                this.events.trigger(this, 'playing');
++                break;
++            case 'pause':
++                if (!this._paused) {
++                    this._paused = true;
++                    this.events.trigger(this, 'pause');
++                }
++                break;
++            case 'waiting':
++                this._setBuffering(true);
++                this.events.trigger(this, 'waiting');
++                break;
++            case 'ready':
++                this._setBuffering(false);
++                // Buffering finished while paused: SyncPlay considers the player ready on its playing event
++                if (!this._seeking) this.events.trigger(this, 'playing');
++                break;
++            case 'seeked':
++                this._seeking = false;
++                this.events.trigger(this, 'timeupdate');
++                break;
++            case 'timeupdate':
++                this.events.trigger(this, 'timeupdate');
++                break;
++            case 'stopped':
++                this._syncPlay = false;
++                this._paused = true;
++                this._groupWaiting = false;
++                this._nativePlayer.setSyncPlayWaiting(false);
++                this.events.trigger(this, 'itemstopped', [{
++                    item: this._currentItem,
++                    mediaSource: this._getMediaSource(),
++                    positionMs: positionMs,
++                    nextItem: null,
++                    nextMediaType: null,
++                }]);
++                this._currentItem = null;
++                break;
++        }
++    }
++
++    /**
++     * Forwards SyncPlay group events to the native player, as the web client is hidden during playback.
++     */
++    _bindGroupUpdates() {
++        if (this._groupUpdatesBound || !window.ServerNotifications) return;
++        this._groupUpdatesBound = true;
++        this.events.on(window.ServerNotifications, 'SyncPlayGroupUpdate', (e, apiClient, update) => {
++            if (!this._syncPlay || !update) return;
++            switch (update.Type) {
++                case 'UserJoined':
++                case 'UserLeft':
++                    this._nativePlayer.notifySyncPlayUser(String(update.Data), update.Type === 'UserJoined');
++                    break;
++                case 'StateUpdate':
++                    this._groupWaiting = update.Data?.State === 'Waiting';
++                    this._updateWaitingHint();
++                    break;
++            }
++        });
++    }
++
++    _setBuffering(buffering) {
++        this._buffering = buffering;
++        this._updateWaitingHint();
++    }
++
++    _updateWaitingHint() {
++        // Only show the hint while this player is ready, i.e. it's waiting for others
++        this._nativePlayer.setSyncPlayWaiting(this._groupWaiting && !this._buffering);
++    }
++
++    _getMediaSource() {
++        return this._currentItem?.MediaSources?.[0] || null;
++    }
++
++    _setPosition(positionMs, sampledAt = Date.now()) {
++        this._currentTime = positionMs;
++        this._positionUpdatedAt = sampledAt;
+     }
+ 
+     shuffle(item) {}
+@@ -54,9 +287,7 @@ export class ExoPlayerPlugin {
+     }
+ 
+     canPlayItem(item, playOptions) {
+-        return this._nativePlayer.isEnabled() &&
+-            playOptions.fullscreen &&
+-            !this.playbackManager.syncPlayEnabled;
++        return this._nativePlayer.isEnabled() && playOptions.fullscreen;
+     }
+ 
+     async stop(destroyPlayer) {
+@@ -72,16 +303,31 @@ export class ExoPlayerPlugin {
+     previousTrack() {}
+ 
+     seek(ticks) {
++        if (this._syncPlay) this._seeking = true;
+         this._nativePlayer.seekTicks(ticks);
+     }
+ 
+     currentTime(ms) {
+         if (ms !== undefined) {
++            if (this._syncPlay) this._seeking = true;
+             this._nativePlayer.seekMs(ms);
+         }
++        if (this._syncPlay && !this._paused) {
++            // Extrapolate between the position updates of the native player
++            return this._currentTime + (Date.now() - this._positionUpdatedAt) * this._playbackRate;
++        }
+         return this._currentTime;
+     }
+ 
++    getPlaybackRate() {
++        return this._playbackRate;
++    }
++
++    setPlaybackRate(value) {
++        this._playbackRate = value;
++        this._nativePlayer.setPlaybackSpeed(value);
++    }
++
+     duration(val) {
+         return null;
+     }
+@@ -123,12 +369,12 @@ export class ExoPlayerPlugin {
+     }
+ 
+     pause() {
+-        this._paused = true;
++        if (!this._syncPlay) this._paused = true;
+         this._nativePlayer.pausePlayer();
+     }
+ 
+     unpause() {
+-        this._paused = false;
++        if (!this._syncPlay) this._paused = false;
+         this._nativePlayer.resumePlayer();
+     }
+ 
+@@ -140,6 +386,31 @@ export class ExoPlayerPlugin {
+         }
+     }
+ 
++    // State getters of the playback manager, used for the player state once events are reported
++    getRepeatMode() {
++        return 'RepeatNone';
++    }
++
++    getQueueShuffleMode() {
++        return 'Sorted';
++    }
++
++    getBufferedRanges() {
++        return [];
++    }
++
++    getAudioStreamIndex() {
++        return null;
++    }
++
++    getSubtitleStreamIndex() {
++        return null;
++    }
++
++    getSecondarySubtitleStreamIndex() {
++        return null;
++    }
++
+     canSetAudioStreamIndex() {
+         return false;
+     }
+@@ -153,13 +424,55 @@ export class ExoPlayerPlugin {
+     async changeSubtitleStream(index) {}
+ 
+     getPlaylist() {
+-        return Promise.resolve([]);
++        return Promise.resolve(this.getPlaylistSync());
+     }
+ 
+-    getCurrentPlaylistItemId() {}
++    getPlaylistSync() {
++        return this._currentItem ? [this._currentItem] : [];
++    }
+ 
+-    setCurrentPlaylistItem() {
+-        return Promise.resolve();
++    currentItem() {
++        return this._currentItem;
++    }
++
++    /**
++     * Whether any media is loaded, used by the playback manager.
++     */
++    isPlaying() {
++        return this._currentItem != null;
++    }
++
++    currentMediaSource() {
++        return this._getMediaSource();
++    }
++
++    getCurrentPlaylistItemId() {
++        return this._currentItem?.PlaylistItemId;
++    }
++
++    getCurrentPlaylistIndex() {
++        return 0;
++    }
++
++    /**
++     * Changes the playing item, used by SyncPlay when the group moves to another item of its queue.
++     * @param {string} playlistItemId The playlist id of the item to play.
++     */
++    async setCurrentPlaylistItem(playlistItemId) {
++        const playbackManager = this.playbackManager;
++        if (!playbackManager.syncPlayEnabled || !playbackManager._localPlay) return;
++
++        // The SyncPlay queue contains the items of the group's queue
++        const playlist = playbackManager._playQueueManager?.getPlaylist?.() || [];
++        const startIndex = playlist.findIndex((item) => item.PlaylistItemId === playlistItemId);
++        if (startIndex < 0) return;
++
++        await playbackManager._localPlay({
++            items: playlist,
++            startIndex: startIndex,
++            startPositionTicks: 0,
++            fullscreen: true,
++        });
+     }
+ 
+     removeFromPlaylist() {
+diff --git a/app/src/main/java/org/jellyfin/mobile/app/AppModule.kt b/app/src/main/java/org/jellyfin/mobile/app/AppModule.kt
+index 6b6ab6c0..1f273fae 100644
+--- a/app/src/main/java/org/jellyfin/mobile/app/AppModule.kt
++++ b/app/src/main/java/org/jellyfin/mobile/app/AppModule.kt
+@@ -66,7 +66,8 @@ val applicationModule = module {
+     single { ImageLoader(androidApplication()) }
+     single { PermissionRequestHelper() }
+     single { RemoteVolumeProvider(get()) }
+-    single(named(PLAYER_EVENT_CHANNEL)) { Channel<PlayerEvent>() }
++    // Buffered, as e.g. SyncPlay sends multiple commands at once (unpause and seek)
++    single(named(PLAYER_EVENT_CHANNEL)) { Channel<PlayerEvent>(Channel.BUFFERED) }
+     factory { WorkManager.getInstance(get()) }
+ 
+     // Controllers
+diff --git a/app/src/main/java/org/jellyfin/mobile/bridge/NativePlayer.kt b/app/src/main/java/org/jellyfin/mobile/bridge/NativePlayer.kt
+index 0a676793..52bce3bb 100644
+--- a/app/src/main/java/org/jellyfin/mobile/bridge/NativePlayer.kt
++++ b/app/src/main/java/org/jellyfin/mobile/bridge/NativePlayer.kt
+@@ -65,4 +65,19 @@ class NativePlayer(
+     fun setVolume(volume: Int) {
+         playerEventChannel.trySend(PlayerEvent.SetVolume(volume))
+     }
++
++    @JavascriptInterface
++    fun setPlaybackSpeed(speed: Float) {
++        playerEventChannel.trySend(PlayerEvent.SetPlaybackSpeed(speed))
++    }
++
++    @JavascriptInterface
++    fun notifySyncPlayUser(userName: String, joined: Boolean) {
++        playerEventChannel.trySend(PlayerEvent.SyncPlayUserChanged(userName, joined))
++    }
++
++    @JavascriptInterface
++    fun setSyncPlayWaiting(waiting: Boolean) {
++        playerEventChannel.trySend(PlayerEvent.SyncPlayWaiting(waiting))
++    }
+ }
+diff --git a/app/src/main/java/org/jellyfin/mobile/player/PlayerViewModel.kt b/app/src/main/java/org/jellyfin/mobile/player/PlayerViewModel.kt
+index 0083d486..8d741049 100644
+--- a/app/src/main/java/org/jellyfin/mobile/player/PlayerViewModel.kt
++++ b/app/src/main/java/org/jellyfin/mobile/player/PlayerViewModel.kt
+@@ -52,6 +52,14 @@ import org.jellyfin.mobile.player.ui.DisplayPreferences
+ import org.jellyfin.mobile.player.ui.PlayState
+ import org.jellyfin.mobile.player.ui.playermenuhelper.PlayerMenuHelper
+ import org.jellyfin.mobile.utils.Constants
++import org.jellyfin.mobile.utils.Constants.SYNCPLAY_EVENT_LOADED
++import org.jellyfin.mobile.utils.Constants.SYNCPLAY_EVENT_PAUSE
++import org.jellyfin.mobile.utils.Constants.SYNCPLAY_EVENT_PLAYING
++import org.jellyfin.mobile.utils.Constants.SYNCPLAY_EVENT_READY
++import org.jellyfin.mobile.utils.Constants.SYNCPLAY_EVENT_SEEKED
++import org.jellyfin.mobile.utils.Constants.SYNCPLAY_EVENT_STOPPED
++import org.jellyfin.mobile.utils.Constants.SYNCPLAY_EVENT_TIME_UPDATE
++import org.jellyfin.mobile.utils.Constants.SYNCPLAY_EVENT_WAITING
+ import org.jellyfin.mobile.utils.Constants.SUPPORTED_VIDEO_PLAYER_PLAYBACK_ACTIONS
+ import org.jellyfin.mobile.utils.applyDefaultAudioAttributes
+ import org.jellyfin.mobile.utils.applyDefaultLocalAudioAttributes
+@@ -65,6 +73,7 @@ import org.jellyfin.mobile.utils.logTracks
+ import org.jellyfin.mobile.utils.seekToOffset
+ import org.jellyfin.mobile.utils.setPlaybackState
+ import org.jellyfin.mobile.utils.toMediaMetadata
++import org.jellyfin.mobile.webapp.WebappFunctionChannel
+ import org.jellyfin.sdk.api.client.ApiClient
+ import org.jellyfin.sdk.api.client.exception.ApiClientException
+ import org.jellyfin.sdk.api.client.extensions.displayPreferencesApi
+@@ -132,6 +141,12 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
+     private val _error = MutableLiveData<String>()
+     val error: LiveData<String> = _error
+ 
++    // SyncPlay group status, shown on top of the player as the web client is hidden during playback
++    private val _syncPlayMessage = MutableLiveData<String>()
++    val syncPlayMessage: LiveData<String> = _syncPlayMessage
++    private val _syncPlayWaiting = MutableLiveData(false)
++    val syncPlayWaiting: LiveData<Boolean> = _syncPlayWaiting
++
+     private val eventLogger = EventLogger()
+     private var analyticsCollector = buildAnalyticsCollector()
+     private val initialTracksSelected = AtomicBoolean(false)
+@@ -150,6 +165,23 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
+ 
+     private val playerEventChannel: Channel<PlayerEvent> by inject(named(PLAYER_EVENT_CHANNEL))
+ 
++    // SyncPlay
++    private val webappFunctionChannel: WebappFunctionChannel by inject()
++
++    /**
++     * Whether playback is controlled by a SyncPlay group of the web client.
++     * User actions are then sent as requests to the group, and player events are reported back to SyncPlay.
++     */
++    var isSyncPlayActive = false
++
++    /**
++     * Identifies the playback in the web client, so that events of a replaced player are ignored.
++     */
++    var syncPlayToken = 0
++    private var syncPlayTimeUpdateJob: Job? = null
++    private var syncPlayLoadedNotified = false
++    private var syncPlayWaitingNotified = false
++
+     val mediaSession: MediaSession by lazy {
+         MediaSession(
+             getApplication<Application>().applicationContext,
+@@ -204,18 +236,27 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
+             }
+         }
+ 
+-        // Subscribe to player events from webapp
++        // Subscribe to player events from webapp, discarding events meant for a previous player
++        @Suppress("ControlFlowWithEmptyBody")
++        while (playerEventChannel.tryReceive().isSuccess) {}
+         viewModelScope.launch {
+             for (event in playerEventChannel) {
+                 when (event) {
+-                    PlayerEvent.Pause -> mediaSessionCallback.onPause()
+-                    PlayerEvent.Resume -> mediaSessionCallback.onPlay()
++                    // Commands from the web client are executed locally, as they may come from a SyncPlay group
++                    PlayerEvent.Pause -> pause()
++                    PlayerEvent.Resume -> play()
+                     PlayerEvent.Stop, PlayerEvent.Destroy -> mediaSessionCallback.onStop()
+                     is PlayerEvent.Seek -> playerOrNull?.seekTo(event.duration.inWholeMilliseconds)
+                     is PlayerEvent.SetVolume -> {
+                         setVolume(event.volume)
+                         playerOrNull?.reportPlaybackState()
+                     }
++                    is PlayerEvent.SetPlaybackSpeed -> setPlaybackSpeed(event.speed)
++                    is PlayerEvent.SyncPlayUserChanged -> {
++                        val messageRes = if (event.joined) R.string.syncplay_user_joined else R.string.syncplay_user_left
++                        _syncPlayMessage.value = getApplication<Application>().getString(messageRes, event.userName)
++                    }
++                    is PlayerEvent.SyncPlayWaiting -> _syncPlayWaiting.value = event.waiting
+                 }
+             }
+         }
+@@ -290,6 +331,8 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
+      * Release the current ExoPlayer and stop/release the current MediaSession
+      */
+     private fun releasePlayer() {
++        notifySyncPlay(SYNCPLAY_EVENT_STOPPED)
++        stopSyncPlayTimeUpdates()
+         notificationHelper.dismissNotification()
+         mediaSession.isActive = false
+         mediaSession.release()
+@@ -305,6 +348,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
+ 
+         player.setMediaSource(exoMediaSource)
+         player.prepare()
++        syncPlayLoadedNotified = false
+ 
+         initialTracksSelected.set(false)
+ 
+@@ -579,6 +623,75 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
+         playerOrNull?.seekToOffset(offsetMs)
+     }
+ 
++    // User initiated player controls, sent as requests to the group while SyncPlay is active.
++    // The group then sends the resulting command to all members, including this one.
++    fun userPlay() {
++        if (isSyncPlayActive) webappFunctionChannel.callPlaybackManagerAction("unpause") else play()
++    }
++
++    fun userPause() {
++        if (isSyncPlayActive) webappFunctionChannel.callPlaybackManagerAction("pause") else pause()
++    }
++
++    fun userPlayPause() {
++        if (playerOrNull?.playWhenReady == true) userPause() else userPlay()
++    }
++
++    fun userSeekTo(positionMs: Long) {
++        if (isSyncPlayActive) {
++            webappFunctionChannel.seekToTicks(positionMs.coerceAtLeast(0) * Constants.TICKS_PER_MILLISECOND)
++        } else {
++            playerOrNull?.seekTo(positionMs)
++        }
++    }
++
++    fun userSeekByOffset(offsetMs: Long) {
++        val player = playerOrNull ?: return
++        userSeekTo(player.currentPosition + offsetMs)
++    }
++
++    fun userRewind() {
++        if (isSyncPlayActive) userSeekByOffset(-displayPreferences.skipBackLength) else rewind()
++    }
++
++    fun userFastForward() {
++        if (isSyncPlayActive) userSeekByOffset(displayPreferences.skipForwardLength) else fastForward()
++    }
++
++    fun userSkipToPrevious() {
++        if (isSyncPlayActive) webappFunctionChannel.callPlaybackManagerAction("previousTrack") else skipToPrevious()
++    }
++
++    fun userSkipToNext() {
++        if (isSyncPlayActive) webappFunctionChannel.callPlaybackManagerAction("nextTrack") else skipToNext()
++    }
++
++    /**
++     * Reports a player event to the ExoPlayer plugin of the web client, which relays it to SyncPlay.
++     */
++    private fun notifySyncPlay(event: String) {
++        if (!isSyncPlayActive) return
++        val position = playerOrNull?.currentPosition ?: return
++        // The time of the measurement allows the web client to compensate the delay of this call
++        val sampledAt = System.currentTimeMillis()
++        webappFunctionChannel.call("window.ExoPlayer?.notifyEvent('$event', $position, $syncPlayToken, $sampledAt);")
++    }
++
++    private fun startSyncPlayTimeUpdates() {
++        if (!isSyncPlayActive || syncPlayTimeUpdateJob?.isActive == true) return
++        syncPlayTimeUpdateJob = viewModelScope.launch {
++            while (true) {
++                delay(Constants.SYNCPLAY_TIME_UPDATE_RATE)
++                notifySyncPlay(SYNCPLAY_EVENT_TIME_UPDATE)
++            }
++        }
++    }
++
++    private fun stopSyncPlayTimeUpdates() {
++        syncPlayTimeUpdateJob?.cancel()
++        syncPlayTimeUpdateJob = null
++    }
++
+     private fun getCurrentChapterStartPosition(chapters: List<ChapterInfo>, playbackPosition: Duration): Duration? {
+         val startPositions = chapters.map { c -> c.startPositionTicks.ticks }
+         return startPositions.findLast { pos -> playbackPosition >= pos }
+@@ -716,6 +829,23 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
+         // Notify fragment of current state
+         _playerState.value = playbackState
+ 
++        when (playbackState) {
++            // Like the HTML video player, only report buffering that interrupts playback
++            Player.STATE_BUFFERING -> if (playWhenReady) {
++                syncPlayWaitingNotified = true
++                notifySyncPlay(SYNCPLAY_EVENT_WAITING)
++            }
++            Player.STATE_READY -> {
++                if (!syncPlayLoadedNotified) {
++                    syncPlayLoadedNotified = true
++                    notifySyncPlay(SYNCPLAY_EVENT_LOADED)
++                }
++                // Buffering finished while paused, otherwise the playing event reports the player as ready
++                if (syncPlayWaitingNotified && !player.isPlaying) notifySyncPlay(SYNCPLAY_EVENT_READY)
++                syncPlayWaitingNotified = false
++            }
++        }
++
+         // Initialise various components
+         if (playbackState == Player.STATE_READY) {
+             if (!initialTracksSelected.getAndSet(true)) {
+@@ -758,7 +888,8 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
+                 }
+                 Player.STATE_ENDED -> {
+                     reportPlaybackStop()
+-                    if (!autoPlayNextEpisodeEnabled || !queueManager.next()) {
++                    // With SyncPlay, the group decides about the next item
++                    if (isSyncPlayActive || !autoPlayNextEpisodeEnabled || !queueManager.next()) {
+                         releasePlayer()
+                     }
+                 }
+@@ -766,8 +897,27 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
+         }
+     }
+ 
++    override fun onIsPlayingChanged(isPlaying: Boolean) {
++        val player = playerOrNull ?: return
++        when {
++            isPlaying -> {
++                notifySyncPlay(SYNCPLAY_EVENT_PLAYING)
++                startSyncPlayTimeUpdates()
++            }
++            !player.playWhenReady -> {
++                notifySyncPlay(SYNCPLAY_EVENT_PAUSE)
++                stopSyncPlayTimeUpdates()
++            }
++        }
++    }
++
+     override fun onPositionDiscontinuity(oldPosition: Player.PositionInfo, newPosition: Player.PositionInfo, reason: Int) {
+         super.onPositionDiscontinuity(oldPosition, newPosition, reason)
++        if (reason == Player.DISCONTINUITY_REASON_SEEK) {
++            notifySyncPlay(SYNCPLAY_EVENT_SEEKED)
++            // A seek within the buffer doesn't interrupt playback, but SyncPlay waits for playback to resume
++            if (playerOrNull?.isPlaying == true) notifySyncPlay(SYNCPLAY_EVENT_PLAYING)
++        }
+         playerOrNull?.setWatchedChapterMarkings()
+         playerOrNull?.updateSkipMediaSegmentButton()
+     }
+diff --git a/app/src/main/java/org/jellyfin/mobile/player/interaction/PlayerEvent.kt b/app/src/main/java/org/jellyfin/mobile/player/interaction/PlayerEvent.kt
+index cbe8e143..ea9a3e18 100644
+--- a/app/src/main/java/org/jellyfin/mobile/player/interaction/PlayerEvent.kt
++++ b/app/src/main/java/org/jellyfin/mobile/player/interaction/PlayerEvent.kt
+@@ -9,4 +9,7 @@ sealed class PlayerEvent {
+     object Destroy : PlayerEvent()
+     data class Seek(val duration: Duration) : PlayerEvent()
+     data class SetVolume(val volume: Int) : PlayerEvent()
++    data class SetPlaybackSpeed(val speed: Float) : PlayerEvent()
++    data class SyncPlayUserChanged(val userName: String, val joined: Boolean) : PlayerEvent()
++    data class SyncPlayWaiting(val waiting: Boolean) : PlayerEvent()
+ }
+diff --git a/app/src/main/java/org/jellyfin/mobile/player/interaction/PlayerMediaSessionCallback.kt b/app/src/main/java/org/jellyfin/mobile/player/interaction/PlayerMediaSessionCallback.kt
+index 81c077ac..0cb353b6 100644
+--- a/app/src/main/java/org/jellyfin/mobile/player/interaction/PlayerMediaSessionCallback.kt
++++ b/app/src/main/java/org/jellyfin/mobile/player/interaction/PlayerMediaSessionCallback.kt
+@@ -7,31 +7,31 @@ import org.jellyfin.mobile.player.PlayerViewModel
+ @SuppressLint("MissingOnPlayFromSearch")
+ class PlayerMediaSessionCallback(private val viewModel: PlayerViewModel) : MediaSession.Callback() {
+     override fun onPlay() {
+-        viewModel.play()
++        viewModel.userPlay()
+     }
+ 
+     override fun onPause() {
+-        viewModel.pause()
++        viewModel.userPause()
+     }
+ 
+     override fun onSeekTo(pos: Long) {
+-        viewModel.playerOrNull?.seekTo(pos)
++        viewModel.userSeekTo(pos)
+     }
+ 
+     override fun onRewind() {
+-        viewModel.rewind()
++        viewModel.userRewind()
+     }
+ 
+     override fun onFastForward() {
+-        viewModel.fastForward()
++        viewModel.userFastForward()
+     }
+ 
+     override fun onSkipToPrevious() {
+-        viewModel.skipToPrevious()
++        viewModel.userSkipToPrevious()
+     }
+ 
+     override fun onSkipToNext() {
+-        viewModel.skipToNext()
++        viewModel.userSkipToNext()
+     }
+ 
+     override fun onStop() {
+diff --git a/app/src/main/java/org/jellyfin/mobile/player/interaction/PlayerWebPreferences.kt b/app/src/main/java/org/jellyfin/mobile/player/interaction/PlayerWebPreferences.kt
+index c17efb46..aec0c06a 100644
+--- a/app/src/main/java/org/jellyfin/mobile/player/interaction/PlayerWebPreferences.kt
++++ b/app/src/main/java/org/jellyfin/mobile/player/interaction/PlayerWebPreferences.kt
+@@ -9,4 +9,6 @@ import kotlinx.serialization.Serializable
+ data class PlayerWebPreferences(
+     val maxStreamingBitrateLocal: Int,
+     val maxStreamingBitrateRemote: Int,
++    val syncPlay: Boolean = false,
++    val syncPlayToken: Int = 0,
+ ) : Parcelable
+diff --git a/app/src/main/java/org/jellyfin/mobile/utils/Constants.kt b/app/src/main/java/org/jellyfin/mobile/utils/Constants.kt
+index 85a2de92..4d8b8487 100644
+--- a/app/src/main/java/org/jellyfin/mobile/utils/Constants.kt
++++ b/app/src/main/java/org/jellyfin/mobile/utils/Constants.kt
+@@ -28,6 +28,7 @@ object Constants {
+     const val PREF_INSTANCE_URL = "pref_instance_url"
+     const val PREF_IGNORE_BATTERY_OPTIMIZATIONS = "pref_ignore_battery_optimizations"
+     const val PREF_IGNORE_WEBVIEW_CHECKS = "pref_ignore_webview_checks"
++    const val PREF_WEBVIEW_DEBUGGING = "pref_webview_debugging"
+     const val PREF_IGNORE_BLUETOOTH_PERMISSION = "pref_ignore_bluetooth_permission"
+     const val PREF_DOWNLOAD_METHOD = "pref_download_method"
+     const val PREF_MUSIC_NOTIFICATION_ALWAYS_DISMISSIBLE = "pref_music_notification_always_dismissible"
+@@ -107,9 +108,11 @@ object Constants {
+     // Video player constants
+     const val LANGUAGE_UNDEFINED = "und"
+     const val PLAYER_TIME_UPDATE_RATE = 10000L
++    const val SYNCPLAY_TIME_UPDATE_RATE = 500L
+     const val CHAPTER_MARKING_UPDATE_DELAY = 1000L
+     const val SKIP_MEDIA_SEGMENT_UPDATE_DELAY = 1000L
+     const val DEFAULT_CONTROLS_TIMEOUT_MS = 2500
++    const val DEFAULT_SEEK_OVERLAY_TIMEOUT_MS = 1000L
+     const val SWIPE_GESTURE_EXCLUSION_SIZE_VERTICAL = 64
+     const val DEFAULT_CENTER_OVERLAY_TIMEOUT_MS = 250
+     const val SWIPE_GESTURE_EXCLUSION_SIZE_HORIZONTAL = 48
+@@ -166,4 +169,14 @@ object Constants {
+     // Misc
+     const val PERCENT_MAX = 100
+     const val DOWNLOAD_PATH = "/MediaCache/"
++
++    // SyncPlay player events, see ExoPlayerPlugin.notifyEvent()
++    const val SYNCPLAY_EVENT_LOADED = "loaded"
++    const val SYNCPLAY_EVENT_PLAYING = "playing"
++    const val SYNCPLAY_EVENT_PAUSE = "pause"
++    const val SYNCPLAY_EVENT_WAITING = "waiting"
++    const val SYNCPLAY_EVENT_READY = "ready"
++    const val SYNCPLAY_EVENT_SEEKED = "seeked"
++    const val SYNCPLAY_EVENT_TIME_UPDATE = "timeupdate"
++    const val SYNCPLAY_EVENT_STOPPED = "stopped"
+ }
+diff --git a/app/src/main/java/org/jellyfin/mobile/webapp/WebappFunctionChannel.kt b/app/src/main/java/org/jellyfin/mobile/webapp/WebappFunctionChannel.kt
+index 59739209..41df6000 100644
+--- a/app/src/main/java/org/jellyfin/mobile/webapp/WebappFunctionChannel.kt
++++ b/app/src/main/java/org/jellyfin/mobile/webapp/WebappFunctionChannel.kt
+@@ -7,7 +7,9 @@ import kotlinx.coroutines.channels.ChannelIterator
+  * Allows to call functions within the webapp
+  */
+ class WebappFunctionChannel {
+-    private val internalChannel = Channel<String>()
++    // Buffered, as multiple calls are often made at once (e.g. the player events reported to SyncPlay),
++    // and a rendezvous channel would drop all but the first one
++    private val internalChannel = Channel<String>(Channel.UNLIMITED)
+ 
+     operator fun iterator(): ChannelIterator<String> = internalChannel.iterator()
+ 
+@@ -22,6 +24,7 @@ class WebappFunctionChannel {
+     )
+ 
+     fun seekTo(pos: Long) = call("$PLAYBACK_MANAGER.seekMs($pos);")
++    fun seekToTicks(ticks: Long) = call("$PLAYBACK_MANAGER.seek($ticks);")
+     fun goBack() = call("$NAVIGATION_HELPER.goBack();")
+ 
+     companion object {
+diff --git a/app/src/main/res/values-de/strings.xml b/app/src/main/res/values-de/strings.xml
+index c11a053e..510700d6 100644
+--- a/app/src/main/res/values-de/strings.xml
++++ b/app/src/main/res/values-de/strings.xml
+@@ -171,4 +171,10 @@
+     <string name="download_location_not_set_description">Um Medien herunterzuladen, gebe bitte einen Ordner an, in den Dateien gespeichert werden sollen.</string>
+     <string name="download_location_inaccessible">Downloadort nicht zugänglich</string>
+     <string name="download_location_inaccessible_description">Der gewählte Ort für Downloads ist nicht mehr zugänglich. Bitte wähle einen anderen Ordner um Downloads fortzusetzen.</string>
++    <string name="syncplay_waiting_for_group">Warte auf andere Gruppenmitglieder …</string>
++    <string name="syncplay_user_joined">%1$s ist der Gruppe beigetreten</string>
++    <string name="syncplay_user_left">%1$s hat die Gruppe verlassen</string>
++    <string name="pref_category_developer">Entwickler</string>
++    <string name="pref_webview_debugging_title">WebView-Debugging</string>
++    <string name="pref_webview_debugging_summary">Erlaubt die Untersuchung der Weboberfläche von einem verbundenen Computer, z. B. über ADB und die Chrome DevTools</string>
+ </resources>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 5c150722..7f4007ee 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -180,4 +180,10 @@
+     <string name="download_location_not_set_description">To download media, please select a folder where the files should be stored.</string>
+     <string name="download_location_inaccessible">Download location inaccessible</string>
+     <string name="download_location_inaccessible_description">The selected download location is no longer accessible. Please select a different folder to resume downloads.</string>
++    <string name="syncplay_waiting_for_group">Waiting for other group members…</string>
++    <string name="syncplay_user_joined">%1$s joined the group</string>
++    <string name="syncplay_user_left">%1$s left the group</string>
++    <string name="pref_category_developer">Developer</string>
++    <string name="pref_webview_debugging_title">WebView debugging</string>
++    <string name="pref_webview_debugging_summary">Allows inspecting the web interface from a connected computer, e.g. via ADB and Chrome DevTools</string>
+ </resources>

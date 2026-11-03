@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jellyfin Fire <cedric@grein.io>
+Date: Tue, 3 Nov 2026 21:28:03 +0100
+Subject: [PATCH 1/6] Fire TV: separate package and launcher integration
+
+---
+ app/build.gradle.kts             |  2 ++
+ app/src/main/AndroidManifest.xml | 10 ++++++++++
+ 2 files changed, 12 insertions(+)
+
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 396dbe27..402833c8 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -62,6 +62,8 @@ android {
+ 
+     buildTypes {
+         getByName("release") {
++            // Separate package, so it can be installed next to the official Jellyfin app
++            applicationIdSuffix = ".fire"
+             isMinifyEnabled = true
+             isShrinkResources = true
+ 
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 6ebe9a6f..2753a7f5 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -21,6 +21,14 @@
+ 
+     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+ 
++    <!-- Allow installation on TV devices (Android TV, Fire TV) -->
++    <uses-feature
++        android:name="android.hardware.touchscreen"
++        android:required="false" />
++    <uses-feature
++        android:name="android.software.leanback"
++        android:required="false" />
++
+     <queries>
+         <intent>
+             <action android:name="android.intent.action.VIEW" />
+@@ -37,6 +45,7 @@
+     <application
+         android:name=".JellyfinApplication"
+         android:allowBackup="true"
++        android:banner="@drawable/app_banner"
+         android:fullBackupContent="@xml/backup_content"
+         android:icon="@mipmap/ic_launcher"
+         android:label="@string/app_name"
+@@ -55,6 +64,7 @@
+             <intent-filter>
+                 <action android:name="android.intent.action.MAIN" />
+                 <category android:name="android.intent.category.LAUNCHER" />
++                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+             </intent-filter>
+             <!-- declare legacy support for voice actions -->
+             <intent-filter>

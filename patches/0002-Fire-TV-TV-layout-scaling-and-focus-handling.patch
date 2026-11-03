@@ -1,0 +1,256 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jellyfin Fire <cedric@grein.io>
+Date: Tue, 3 Nov 2026 21:28:03 +0100
+Subject: [PATCH 2/6] Fire TV: TV layout, scaling and focus handling
+
+---
+ app/src/main/assets/native/nativeshell.js     | 60 ++++++++++++++++++-
+ .../jellyfin/mobile/bridge/NativeInterface.kt |  2 +
+ .../org/jellyfin/mobile/utils/SystemUtils.kt  | 13 +++-
+ .../org/jellyfin/mobile/utils/WebViewUtils.kt |  3 +
+ .../jellyfin/mobile/webapp/WebViewFragment.kt | 18 ++++++
+ .../drawable/ripple_background_circular.xml   | 12 +++-
+ 6 files changed, 104 insertions(+), 4 deletions(-)
+
+diff --git a/app/src/main/assets/native/nativeshell.js b/app/src/main/assets/native/nativeshell.js
+index 30f77ccc..ffc808a5 100644
+--- a/app/src/main/assets/native/nativeshell.js
++++ b/app/src/main/assets/native/nativeshell.js
+@@ -31,9 +31,64 @@ for (const plugin of plugins) {
+     };
+ }
+ 
+-const { deviceId, deviceName, appName, appVersion } = JSON.parse(window.NativeInterface.getDeviceInformation());
++const { deviceId, deviceName, appName, appVersion, isTv } = JSON.parse(window.NativeInterface.getDeviceInformation());
+ const codecCaps = JSON.parse(window.NativeInterface.getCodecCapabilities());
+ 
++// TV specific adjustments: render at a larger viewport width (scaled down to fit
++// the screen by the WebView) and load style tweaks for the TV layout
++const TV_VIEWPORT_WIDTH = 1480;
++if (isTv) {
++    const viewport = document.querySelector('meta[name=viewport]');
++    if (viewport) {
++        viewport.content = `width=${TV_VIEWPORT_WIDTH}, user-scalable=no, viewport-fit=cover`;
++    }
++
++    // TV devices often report the pixel ratio of a 4K panel while the UI is only rendered in 1080p,
++    // which makes the web client request far larger images than can be displayed. Report the actual
++    // ratio between the 1080p surface and the viewport instead, with some headroom for sharpness.
++    const tvPixelRatio = Math.min(window.devicePixelRatio, (1920 / TV_VIEWPORT_WIDTH) * 1.25);
++    Object.defineProperty(window, 'devicePixelRatio', { get: () => tvPixelRatio });
++
++    // Let SyncPlay continuously correct the playback position by default, as the playback of other
++    // group members (e.g. HLS streams starting at keyframes) often differs by a few seconds
++    try {
++        if (localStorage.getItem('syncPlay-enableSyncCorrection') === null) {
++            localStorage.setItem('syncPlay-enableSyncCorrection', 'true');
++        }
++        // Changing the playback speed has no effect with audio passthrough (e.g. Dolby Digital to the TV),
++        // so correct differences by skipping instead
++        if (localStorage.getItem('syncPlay-useSpeedToSync') === null) {
++            localStorage.setItem('syncPlay-useSpeedToSync', 'false');
++        }
++    } catch (e) {
++        console.warn('Failed to apply SyncPlay defaults', e);
++    }
++
++    // When the focus got lost (nothing or only the root is focused), arrow keys would have nowhere
++    // to navigate from. Focus the first visible element of the open dialog or the current page instead.
++    document.addEventListener('keydown', (event) => {
++        if (!['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter'].includes(event.key)) return;
++        const active = document.activeElement;
++        if (active && active !== document.body && active.id !== 'reactRoot' && active.offsetParent !== null) return;
++
++        const container = document.querySelector('.dialogContainer .dialog')
++            || document.querySelector('.page:not(.hide)')
++            || document.body;
++        const target = Array.from(container.querySelectorAll('input, select, textarea, button, a[href], [tabindex]:not([tabindex="-1"])'))
++            .find((element) => !element.disabled && element.offsetParent !== null);
++        if (target) {
++            target.focus();
++            event.preventDefault();
++            event.stopPropagation();
++        }
++    }, true);
++
++    const tvStyle = document.createElement('link');
++    tvStyle.rel = 'stylesheet';
++    tvStyle.href = '/native/tv.css';
++    document.head.appendChild(tvStyle);
++}
++
+ window.NativeShell = {
+     enableFullscreen() {
+         window.NativeInterface.enableFullscreen();
+@@ -106,7 +161,8 @@ function getDeviceProfile(profileBuilder, item) {
+ window.NativeShell.AppHost = {
+     init() {},
+     getDefaultLayout() {
+-        return "mobile";
++        // The web client's TV layout provides spatial navigation for D-pad remotes
++        return isTv ? "tv" : "mobile";
+     },
+     supports(command) {
+         command = command.toLowerCase();
+diff --git a/app/src/main/java/org/jellyfin/mobile/bridge/NativeInterface.kt b/app/src/main/java/org/jellyfin/mobile/bridge/NativeInterface.kt
+index a61539cf..7acf3e37 100644
+--- a/app/src/main/java/org/jellyfin/mobile/bridge/NativeInterface.kt
++++ b/app/src/main/java/org/jellyfin/mobile/bridge/NativeInterface.kt
+@@ -31,6 +31,7 @@ import org.jellyfin.mobile.utils.Constants.EXTRA_ITEM_ID
+ import org.jellyfin.mobile.utils.Constants.EXTRA_PLAYER_ACTION
+ import org.jellyfin.mobile.utils.Constants.EXTRA_POSITION
+ import org.jellyfin.mobile.utils.Constants.EXTRA_TITLE
++import org.jellyfin.mobile.utils.isTvDevice
+ import org.jellyfin.mobile.webapp.RemotePlayerService
+ import org.jellyfin.mobile.webapp.RemoteVolumeProvider
+ import org.jellyfin.sdk.api.client.ApiClient
+@@ -65,6 +66,7 @@ class NativeInterface(private val context: Context) : KoinComponent {
+             put("deviceName", name)
+             put("appName", clientInfo.name)
+             put("appVersion", clientInfo.version)
++            put("isTv", context.isTvDevice)
+         }.toString()
+     } catch (e: Exception) {
+         null
+diff --git a/app/src/main/java/org/jellyfin/mobile/utils/SystemUtils.kt b/app/src/main/java/org/jellyfin/mobile/utils/SystemUtils.kt
+index 902b84f2..4cfcdc22 100644
+--- a/app/src/main/java/org/jellyfin/mobile/utils/SystemUtils.kt
++++ b/app/src/main/java/org/jellyfin/mobile/utils/SystemUtils.kt
+@@ -5,10 +5,12 @@ import android.app.Activity
+ import android.app.ActivityManager
+ import android.app.NotificationChannel
+ import android.app.NotificationManager
++import android.app.UiModeManager
+ import android.content.ActivityNotFoundException
+ import android.content.Context
+ import android.content.Intent
+ import android.content.pm.PackageManager
++import android.content.res.Configuration
+ import android.net.Uri
+ import android.os.PowerManager
+ import android.provider.Settings
+@@ -33,7 +35,8 @@ import java.util.UUID
+ import kotlin.coroutines.resume
+ 
+ fun WebViewFragment.requestNoBatteryOptimizations(rootView: CoordinatorLayout) {
+-    if (AndroidVersion.isAtLeastM) {
++    // TV devices have no battery, and the snackbar can't be dismissed with a remote
++    if (AndroidVersion.isAtLeastM && !requireContext().isTvDevice) {
+         val powerManager = requireContext().getSystemService(Activity.POWER_SERVICE) as PowerManager
+         if (
+             !appPreferences.ignoreBatteryOptimizations &&
+@@ -114,6 +117,14 @@ fun Context.createMediaNotificationChannel(notificationManager: NotificationMana
+ val Context.isLowRamDevice: Boolean
+     get() = getSystemService<ActivityManager>()!!.isLowRamDevice
+ 
++/**
++ * Whether the app is running on a TV device (Android TV, Google TV or Amazon Fire TV).
++ */
++val Context.isTvDevice: Boolean
++    get() = getSystemService<UiModeManager>()?.currentModeType == Configuration.UI_MODE_TYPE_TELEVISION ||
++        packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK) ||
++        packageManager.hasSystemFeature("amazon.hardware.fire_tv")
++
+ fun Uri.extractId(): String {
+     val uri = toString()
+     val idRegex = Regex("""/([a-f0-9]{32}|[a-f0-9-]{36})/""")
+diff --git a/app/src/main/java/org/jellyfin/mobile/utils/WebViewUtils.kt b/app/src/main/java/org/jellyfin/mobile/utils/WebViewUtils.kt
+index 8b80bd68..7b0534e0 100644
+--- a/app/src/main/java/org/jellyfin/mobile/utils/WebViewUtils.kt
++++ b/app/src/main/java/org/jellyfin/mobile/utils/WebViewUtils.kt
+@@ -73,6 +73,9 @@ fun WebSettings.applyDefault() {
+     javaScriptEnabled = true
+     domStorageEnabled = true
+     setSupportMultipleWindows(true)
++    // The web client starts playback without a user gesture, e.g. when SyncPlay resumes the group
++    // playback or the next item of a queue starts (matches the "htmlvideoautoplay" app feature)
++    mediaPlaybackRequiresUserGesture = false
+ }
+ 
+ /**
+diff --git a/app/src/main/java/org/jellyfin/mobile/webapp/WebViewFragment.kt b/app/src/main/java/org/jellyfin/mobile/webapp/WebViewFragment.kt
+index 2d4dcc5a..45ef1d92 100644
+--- a/app/src/main/java/org/jellyfin/mobile/webapp/WebViewFragment.kt
++++ b/app/src/main/java/org/jellyfin/mobile/webapp/WebViewFragment.kt
+@@ -18,6 +18,7 @@ import androidx.appcompat.app.AlertDialog
+ import androidx.core.view.doOnNextLayout
+ import androidx.core.view.isVisible
+ import androidx.fragment.app.Fragment
++import androidx.fragment.app.FragmentManager
+ import androidx.lifecycle.Lifecycle
+ import androidx.lifecycle.lifecycleScope
+ import androidx.webkit.WebViewAssetLoader.AssetsPathHandler
+@@ -44,6 +45,7 @@ import org.jellyfin.mobile.utils.extensions.getParcelableCompat
+ import org.jellyfin.mobile.utils.extensions.replaceFragment
+ import org.jellyfin.mobile.utils.fadeIn
+ import org.jellyfin.mobile.utils.isOutdated
++import org.jellyfin.mobile.utils.isTvDevice
+ import org.jellyfin.mobile.utils.requestNoBatteryOptimizations
+ import org.jellyfin.mobile.utils.runOnUiThread
+ import org.koin.android.ext.android.inject
+@@ -152,6 +154,7 @@ class WebViewFragment : Fragment(), BackPressInterceptor, JellyfinWebChromeClien
+ 
+         // Setup WebView
+         webView.initialize()
++        parentFragmentManager.addOnBackStackChangedListener(backStackChangedListener)
+ 
+         webViewBinding!!.useDifferentServerButton.setOnClickListener {
+             webView.removeCallbacks(timeoutRunnable)
+@@ -174,9 +177,19 @@ class WebViewFragment : Fragment(), BackPressInterceptor, JellyfinWebChromeClien
+ 
+     override fun onDestroyView() {
+         super.onDestroyView()
++        parentFragmentManager.removeOnBackStackChangedListener(backStackChangedListener)
+         webViewBinding = null
+     }
+ 
++    private val backStackChangedListener = FragmentManager.OnBackStackChangedListener {
++        val webView = webViewBinding?.webView ?: return@OnBackStackChangedListener
++        // Other fragments (player, settings, downloads) are added on top of this one. The web view would
++        // keep the focus below them, so that remote control keys never reach the visible fragment.
++        val isOnTop = parentFragmentManager.findFragmentById(R.id.fragment_container) === this
++        webView.isFocusable = isOnTop
++        if (isOnTop) webView.requestFocus()
++    }
++
+     private fun WebView.initialize() {
+         if (!appPreferences.ignoreWebViewChecks && isOutdated()) { // Check WebView version
+             showOutdatedWebViewDialog(this)
+@@ -185,6 +198,11 @@ class WebViewFragment : Fragment(), BackPressInterceptor, JellyfinWebChromeClien
+         webViewClient = jellyfinWebViewClient
+         webChromeClient = JellyfinWebChromeClient(this@WebViewFragment)
+         settings.applyDefault()
++        if (context.isTvDevice) {
++            // Let the web client define a wider viewport (see nativeshell.js) and fit it to the screen
++            settings.useWideViewPort = true
++            settings.loadWithOverviewMode = true
++        }
+         addJavascriptInterface(NativeInterface(requireContext()), "NativeInterface")
+         addJavascriptInterface(nativePlayer, "NativePlayer")
+         addJavascriptInterface(externalPlayer, "ExternalPlayer")
+diff --git a/app/src/main/res/drawable/ripple_background_circular.xml b/app/src/main/res/drawable/ripple_background_circular.xml
+index 3eb6c84a..890b658b 100644
+--- a/app/src/main/res/drawable/ripple_background_circular.xml
++++ b/app/src/main/res/drawable/ripple_background_circular.xml
+@@ -1,9 +1,19 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <ripple xmlns:android="http://schemas.android.com/apk/res/android"
+     android:color="?attr/colorControlHighlight">
++    <!-- Highlight for keyboard and remote control navigation -->
++    <item>
++        <selector>
++            <item android:state_focused="true">
++                <shape android:shape="oval">
++                    <solid android:color="#B300A4DC" />
++                </shape>
++            </item>
++        </selector>
++    </item>
+     <item android:id="@android:id/mask">
+         <shape android:shape="oval">
+             <solid android:color="@android:color/white" />
+         </shape>
+     </item>
+-</ripple>
+\ No newline at end of file
++</ripple>
