@@ -68,3 +68,16 @@ cd work/jellyfin-android
 git add <files> && git am --continue
 cd ../.. && ./fire.sh export
 ```
+
+## CI
+
+`.github/workflows/build.yml` builds the APK on every push to `main`, for pull requests and manually (Actions → Build → Run workflow), and attaches it to the run as the **JellyfinFire** artifact. A tag `v*` (e.g. `v2.7.3-fire1`) additionally creates a GitHub release with the APK.
+
+The signing key only exists as encrypted repository secrets (Settings → Secrets and variables → Actions):
+
+| Secret | Contents |
+|---|---|
+| `KEYSTORE_BASE64` | Keystore, base64-encoded (`base64 -w0 release.jks`) |
+| `KEYSTORE_PASSWORD` | Keystore password |
+| `KEY_ALIAS` | Key alias |
+| `KEY_PASSWORD` | Key password |

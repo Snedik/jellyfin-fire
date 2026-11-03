@@ -1,2 +1,7 @@
 /work/
 /dist/
+
+# Signing data belongs in ~/.jellyfin-fire/ or the CI secrets, never in the repository
+*.jks
+*.keystore
+signing.properties
