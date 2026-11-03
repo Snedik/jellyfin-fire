@@ -1,9 +1,17 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Jellyfin Fire <cedric@grein.io>
-Date: Tue, 3 Nov 2026 21:28:03 +0100
-Subject: [PATCH 6/6] Fix integrated player crash on Android 9 / Fire TV (PR
- #2224)
+From: Snedik <cedric@grein.io>
+Date: Tue, 3 Nov 2026 21:52:32 +0100
+Subject: [PATCH 6/6] Fix integrated player crash on Android 9 / Fire TV
 
+Starts the foreground service before the asynchronous image load, so it
+isn't stopped by Android for missing the 5 second startForeground()
+deadline. Based on jellyfin/jellyfin-android#2224 by Alexander Gehres.
+Additionally, the notification is skipped on TV devices, which have no
+notification shade, and media actions use the SyncPlay-aware user
+actions of the view model.
+
+Co-authored-by: Alexander Gehres <alexander.gehres@sap.com>
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 ---
  .../interaction/PlayerNotificationHelper.kt   | 126 ++++++++++--------
  1 file changed, 74 insertions(+), 52 deletions(-)

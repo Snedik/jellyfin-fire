@@ -11,6 +11,15 @@ This repository doesn't contain the app's source code. It contains only the chan
 | `overlay/` | New files, copied into the source tree as-is |
 | `fire.sh` | Build script |
 
+> [!NOTE]
+> **This is not an official Jellyfin project.** The changes were developed predominantly with the help of an LLM (Claude by Anthropic) and tested on a Fire TV Stick 4K and an Android phone; commits are marked with `Co-Authored-By: Claude`. See the [Jellyfin LLM policy](https://jellyfin.org/docs/general/contributing/llm-policies/).
+
+## License and credits
+
+- Based on [jellyfin-android](https://github.com/jellyfin/jellyfin-android) by the Jellyfin contributors, licensed under the **GPL-2.0** ([LICENSE.md](LICENSE.md)); the patches and overlay files are under the same license.
+- Patch 0006 is based on [jellyfin/jellyfin-android#2224](https://github.com/jellyfin/jellyfin-android/pull/2224) by Alexander Gehres.
+- The upstream git history is kept unchanged: the build applies the patches on top of the original source.
+
 ## Patches
 
 1. **Separate package and launcher integration**: package `org.jellyfin.mobile.fire` (installs next to the official app), Leanback launcher, banner

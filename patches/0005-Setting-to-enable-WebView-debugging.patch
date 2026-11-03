@@ -1,8 +1,9 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Jellyfin Fire <cedric@grein.io>
-Date: Tue, 3 Nov 2026 21:28:03 +0100
+From: Snedik <cedric@grein.io>
+Date: Tue, 3 Nov 2026 21:52:32 +0100
 Subject: [PATCH 5/6] Setting to enable WebView debugging
 
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 ---
  .../org/jellyfin/mobile/JellyfinApplication.kt   | 16 +++++++++-------
  .../org/jellyfin/mobile/app/AppPreferences.kt    |  3 +++
